@@ -37,8 +37,18 @@ const maxAccountKeys = 256
 // v1 only, and solana-sdk #1007 moved these checks out of the Rust parsers into
 // the runtime. Callers that track the cluster's limits can pass their own
 // values to SanitizeWithV1Limits; everyone else should use DefaultV1Limits.
+// Raising a limit does not make a cluster accept the message: use a raised
+// limit only after the target cluster has activated the matching feature.
 //
-// Every field is applied as given: a zero field rejects every v1 message.
+// The limits never relax the wire format. A v1 message carries at most 255
+// addresses and 255 instructions however large a limit is, and every other
+// structural check still applies. Neither the limits nor Sanitize compare the
+// serialized size with MaxTransactionSizeV1; the cluster enforces that.
+//
+// Each field is an ordinary maximum count. The zero value rejects every v1
+// message, and so does a zero MaxSignatures or MaxAddresses alone, because
+// every v1 message has a fee payer. A zero MaxInstructions still accepts a
+// message with no instructions.
 type V1Limits struct {
 	// MaxSignatures is the maximum number of required signatures.
 	MaxSignatures int
@@ -66,9 +76,9 @@ func (m *Message) Sanitize() error {
 }
 
 // SanitizeWithV1Limits is Sanitize with caller-supplied v1 policy limits.
-// The limits apply only to v1 messages; every other v1 check (duplicate
-// addresses, heap size, address table lookups, header and index bounds) and
-// all legacy and v0 checks are unchanged.
+// The limits apply only to v1 messages; every other v1 check (wire-format
+// counts, duplicate addresses, heap size, address table lookups, header and
+// index bounds) and all legacy and v0 checks are unchanged.
 func (m *Message) SanitizeWithV1Limits(limits V1Limits) error {
 	switch m.version {
 	case MessageVersionV1:
@@ -170,6 +180,15 @@ func (m *Message) sanitizeV1(limits V1Limits) error {
 	if numKeys > limits.MaxAddresses {
 		return newSanitizeError("too many addresses: %d > max %d", numKeys, limits.MaxAddresses)
 	}
+	// The wire format stores both counts in one byte whatever the policy
+	// limits are. These run after the policy checks, so the default limits
+	// keep reporting the policy error first.
+	if len(m.Instructions) > maxV1WireCount {
+		return newSanitizeError("too many instructions: %d > wire limit %d", len(m.Instructions), maxV1WireCount)
+	}
+	if numKeys > maxV1WireCount {
+		return newSanitizeError("too many addresses: %d > wire limit %d", numKeys, maxV1WireCount)
+	}
 	if err := m.sanitizeHeader(numKeys, "account_keys"); err != nil {
 		return err
 	}
@@ -189,11 +208,11 @@ func (m *Message) sanitizeV1(limits V1Limits) error {
 		return newSanitizeError("message has no account keys")
 	}
 	for i, ci := range m.Instructions {
-		if len(ci.Accounts) > 255 {
-			return newSanitizeError("instruction %d: too many accounts (%d), max 255", i, len(ci.Accounts))
+		if len(ci.Accounts) > maxV1WireCount {
+			return newSanitizeError("instruction %d: too many accounts (%d), max %d", i, len(ci.Accounts), maxV1WireCount)
 		}
-		if len(ci.Data) > 65535 {
-			return newSanitizeError("instruction %d: data too large (%d bytes), max 65535", i, len(ci.Data))
+		if len(ci.Data) > maxV1InstructionDataLen {
+			return newSanitizeError("instruction %d: data too large (%d bytes), max %d", i, len(ci.Data), maxV1InstructionDataLen)
 		}
 	}
 	return m.sanitizeInstructions(numKeys-1, numKeys-1, "out of bounds (max %d)")

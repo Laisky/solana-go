@@ -214,6 +214,10 @@ func TransactionV1Config(config TransactionConfig) TransactionOption {
 // TransactionV1Limits sets the v1 policy limits NewTransaction checks a v1
 // message against (default DefaultV1Limits). It does not select v1 by itself
 // and has no effect on legacy or v0 messages.
+//
+// The limits are not recorded in the transaction. Validate it later with
+// Transaction.SanitizeWithV1Limits and the same limits; Transaction.Sanitize
+// keeps using DefaultV1Limits.
 func TransactionV1Limits(limits V1Limits) TransactionOption {
 	return transactionOptionFunc(func(opts *transactionOptions) { opts.v1Limits = &limits })
 }

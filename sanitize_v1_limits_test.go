@@ -255,3 +255,131 @@ func TestNewTransaction_V1Limits(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, MessageVersionLegacy, tx.Message.GetVersion())
 }
+
+// unboundedV1Limits are policy limits above every v1 wire count, so only the
+// wire format bounds what SanitizeWithV1Limits accepts.
+var unboundedV1Limits = V1Limits{MaxSignatures: 1 << 20, MaxAddresses: 1 << 20, MaxInstructions: 1 << 20}
+
+// Whatever the policy limits, SanitizeWithV1Limits never accepts a v1 message
+// that MarshalV1 cannot encode: v1 stores the address and instruction counts
+// in one byte each.
+func TestV1SanitizeWithV1Limits_WireCountsBoundEveryLimit(t *testing.T) {
+	cases := []struct {
+		name    string
+		build   func(t *testing.T) Message
+		wantErr string
+	}{
+		{"255 addresses", func(t *testing.T) Message { return v1MessageWithAddresses(t, 255) }, ""},
+		{"256 addresses", func(t *testing.T) Message { return v1MessageWithAddresses(t, 256) }, "too many addresses: 256 > wire limit 255"},
+		{"255 instructions", func(t *testing.T) Message { return v1MessageWithInstructions(t, 255) }, ""},
+		{"256 instructions", func(t *testing.T) Message { return v1MessageWithInstructions(t, 256) }, "too many instructions: 256 > wire limit 255"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := tc.build(t)
+			sanitizeErr := msg.SanitizeWithV1Limits(unboundedV1Limits)
+			_, marshalErr := msg.MarshalV1()
+			if tc.wantErr == "" {
+				require.NoError(t, sanitizeErr)
+				require.NoError(t, marshalErr, "an accepted message must be encodable")
+				return
+			}
+			require.Error(t, sanitizeErr)
+			assert.True(t, IsSanitizeError(sanitizeErr))
+			assert.Contains(t, sanitizeErr.Error(), tc.wantErr)
+			require.Error(t, marshalErr, "the wire format cannot carry this message either")
+		})
+	}
+}
+
+// The default limits still report the policy error first, so the wire-count
+// check never changes what Sanitize returns.
+func TestV1Sanitize_DefaultErrorUnchangedPastWireCount(t *testing.T) {
+	msg := v1MessageWithAddresses(t, 256)
+	err := msg.Sanitize()
+	require.Error(t, err)
+	assert.Equal(t, "too many addresses: 256 > max 64", err.Error())
+
+	msg = v1MessageWithInstructions(t, 256)
+	err = msg.Sanitize()
+	require.Error(t, err)
+	assert.Equal(t, "too many instructions: 256 > max 64", err.Error())
+}
+
+// A zero field is an ordinary maximum count. V1Limits{} rejects every v1
+// message, and so does a zero MaxSignatures or MaxAddresses alone, because
+// every v1 message has a fee payer; a zero MaxInstructions still accepts a
+// message with no instructions.
+func TestV1SanitizeWithV1Limits_ZeroFieldSemantics(t *testing.T) {
+	msg := createTestV1Message(t)
+	msg.Instructions = nil
+	require.NoError(t, msg.Sanitize())
+
+	limits := DefaultV1Limits()
+	limits.MaxInstructions = 0
+	require.NoError(t, msg.SanitizeWithV1Limits(limits))
+	oneInstruction := v1MessageWithInstructions(t, 1)
+	require.Error(t, oneInstruction.SanitizeWithV1Limits(limits))
+
+	limits = DefaultV1Limits()
+	limits.MaxSignatures = 0
+	require.Error(t, msg.SanitizeWithV1Limits(limits))
+
+	limits = DefaultV1Limits()
+	limits.MaxAddresses = 0
+	require.Error(t, msg.SanitizeWithV1Limits(limits))
+
+	require.Error(t, msg.SanitizeWithV1Limits(V1Limits{}))
+}
+
+// newV1TransferToAccounts returns an instruction that references the payer
+// plus extra unique accounts, so a v1 message built from it lists
+// extra+2 addresses (payer, the extra accounts, and the program).
+func newV1TransferToAccounts(payer PublicKey, extra int) Instruction {
+	metas := AccountMetaSlice{Meta(payer).WRITE().SIGNER()}
+	for range extra {
+		metas = append(metas, Meta(newUniqueKey()))
+	}
+	return NewInstruction(newUniqueKey(), metas, nil)
+}
+
+// NewTransaction applies the same wire-count bound as SanitizeWithV1Limits,
+// so unbounded limits cannot build an unencodable v1 transaction.
+func TestNewTransaction_V1LimitsCannotExceedWireCounts(t *testing.T) {
+	payer := newUniqueKey()
+	opts := []TransactionOption{
+		TransactionPayer(payer),
+		TransactionMessageVersion(MessageVersionV1),
+		TransactionV1Limits(unboundedV1Limits),
+	}
+
+	tx, err := NewTransaction([]Instruction{newV1TransferToAccounts(payer, 253)}, uniqueHash(), opts...)
+	require.NoError(t, err)
+	require.Len(t, tx.Message.AccountKeys, 255)
+	_, err = tx.Message.MarshalV1()
+	require.NoError(t, err)
+
+	_, err = NewTransaction([]Instruction{newV1TransferToAccounts(payer, 254)}, uniqueHash(), opts...)
+	require.Error(t, err)
+	assert.True(t, IsSanitizeError(err))
+	assert.Contains(t, err.Error(), "too many addresses: 256 > wire limit 255")
+}
+
+// NewTransaction does not record the limits it was given: Sanitize keeps
+// using DefaultV1Limits, so a transaction built with raised limits has to be
+// checked again with the same limits.
+func TestNewTransaction_V1LimitsAreNotRecorded(t *testing.T) {
+	payer := newUniqueKey()
+	tx, err := NewTransaction([]Instruction{newV1TransferToAccounts(payer, 94)}, uniqueHash(),
+		TransactionPayer(payer),
+		TransactionMessageVersion(MessageVersionV1),
+		TransactionV1Limits(raisedV1Limits),
+	)
+	require.NoError(t, err)
+	tx.Signatures = make([]Signature, tx.Message.Header.NumRequiredSignatures)
+
+	err = tx.Sanitize()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too many addresses: 96 > max 64")
+	require.NoError(t, tx.SanitizeWithV1Limits(raisedV1Limits))
+}
